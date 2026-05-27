@@ -90,7 +90,11 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d @/tmp/payload.json \
-            | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary.txt
+            > /tmp/response_raw.txt
+          echo "=== RAW RESPONSE ==="
+          cat /tmp/response_raw.txt
+          echo "=== END ==="
+          jq -r '.choices[0].message.content // "Không thể tóm tắt được."' /tmp/response_raw.txt > /tmp/summary.txt
           echo "Summary:"
           cat /tmp/summary.txt
 
