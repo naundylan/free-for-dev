@@ -2,8 +2,8 @@ name: Notify Free-for-dev Changes
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Chạy mỗi 6 tiếng
-  workflow_dispatch:        # Cho phép chạy thủ công
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   check-and-notify:
@@ -41,92 +41,78 @@ jobs:
 
       - name: Get diff from upstream
         if: steps.compare.outputs.changed == 'true'
-        id: diff
         run: |
           git remote add upstream https://github.com/ripienaar/free-for-dev.git || true
           git fetch upstream main --depth=2
-
-          # Lấy toàn bộ diff của tất cả file (trừ file config, lock)
-          DIFF=$(git diff upstream/main~1 upstream/main \
+          git diff upstream/main~1 upstream/main \
             -- '*.md' '*.json' '*.yaml' '*.yml' \
             ':!package-lock.json' ':!yarn.lock' \
-            | head -500)
-
-          # Lưu vào file thay vì env để tránh giới hạn size
-          echo "$DIFF" > /tmp/upstream_diff.txt
+            | head -500 > /tmp/upstream_diff.txt
+          echo "Diff size: $(wc -c < /tmp/upstream_diff.txt) bytes"
 
       - name: Summarize with AI via OpenRouter
         if: steps.compare.outputs.changed == 'true'
-        id: summary
         run: |
           DIFF=$(cat /tmp/upstream_diff.txt)
 
-          PROMPT="Bạn là trợ lý phân tích changelog cho developer Việt Nam.
+          # Viết prompt ra file để tránh lỗi YAML với ký tự đặc biệt
+          cat > /tmp/prompt.txt << 'PROMPT_EOF'
+Ban la tro ly phan tich changelog cho developer Viet Nam.
 
-Dưới đây là git diff từ repo free-for-dev (danh sách công cụ/dịch vụ free cho developer).
+Duoi day la git diff tu repo free-for-dev (danh sach cong cu/dich vu free cho developer).
 
-Hãy phân tích và trả lời ĐÚNG theo format sau, KHÔNG thêm bất kỳ nội dung nào ngoài format:
+Hay phan tich va tra loi DUNG theo format sau, KHONG them bat ky noi dung nao ngoai format:
 
-Nếu có tool MỚI được thêm vào, với MỖI tool viết:
-🛠 [Tên Tool]
-📌 Về gì: [1 câu mô tả lĩnh vực, ví dụ: dịch vụ host backend miễn phí]
-🎁 Free tier: [giới hạn cụ thể, ví dụ: 512MB RAM, 1GB storage, không giới hạn request]
-💡 Dùng khi: [2-3 usecase thực tế ngắn gọn, ví dụ: host API nhỏ, deploy side project, test MVP]
+Neu co tool MOI duoc them vao, voi MOI tool viet:
+🛠 [Ten Tool]
+📌 Ve gi: [1 cau mo ta linh vuc, vi du: dich vu host backend mien phi]
+🎁 Free tier: [gioi han cu the, vi du: 512MB RAM, 1GB storage, khong gioi han request]
+💡 Dung khi: [2-3 usecase thuc te ngan gon, vi du: host API nho, deploy side project, test MVP]
 
-Nếu có tool BỊ XÓA:
-❌ [Tên Tool] — [lý do nếu có, nếu không thì ghi 'không rõ lý do']
+Neu co tool BI XOA:
+❌ [Ten Tool] — [ly do neu co, neu khong thi ghi: khong ro ly do]
 
-Nếu có tool được CẬP NHẬT thông tin:
-✏️ [Tên Tool] — [thay đổi gì cụ thể]
+Neu co tool duoc CAP NHAT thong tin:
+✏️ [Ten Tool] — [thay doi gi cu the]
 
-Nếu KHÔNG có thay đổi nào đáng chú ý (chỉ fix typo, format...):
-ℹ️ Không có tool mới, chỉ cập nhật nhỏ.
+Neu KHONG co thay doi nao dang chu y (chi fix typo, format...):
+ℹ️ Khong co tool moi, chi cap nhat nho.
 
 ---
-DIFF:
-$DIFF"
+PROMPT_EOF
 
-          PAYLOAD=$(jq -n \
-            --arg prompt "$PROMPT" \
-            '{
-              model: "nvidia/nemotron-3-super-120b-a12b:free",
-              max_tokens: 2048,
-              messages: [
-                {
-                  role: "user",
-                  content: $prompt
-                }
-              ]
-            }')
+          # Gộp prompt + diff
+          FULL_PROMPT=$(cat /tmp/prompt.txt; echo "DIFF:"; echo "$DIFF")
 
+          # Gọi OpenRouter API
           RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d "$(jq -n --arg content "$FULL_PROMPT" '{
+              model: "nvidia/nemotron-3-super-120b-a12b:free",
+              max_tokens: 2048,
+              messages: [{ role: "user", content: $content }]
+            }')")
 
-          echo "$RESPONSE" | jq -r '.choices[0].message.content // "⚠️ Không thể tóm tắt được."' > /tmp/summary.txt
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Khong the tom tat duoc."' > /tmp/summary.txt
+          echo "Summary generated:"
+          cat /tmp/summary.txt
 
       - name: Send to Telegram
         if: steps.compare.outputs.changed == 'true'
         run: |
-          SUMMARY=$(cat /tmp/summary.txt)
-
-          # Telegram giới hạn 4096 ký tự, cắt nếu quá dài
-          SUMMARY=$(echo "$SUMMARY" | head -c 3500)
-
-          MESSAGE="🔔 *free\-for\-dev có cập nhật mới\!*
-
-━━━━━━━━━━━━━━━
-${SUMMARY}
-━━━━━━━━━━━━━━━
-🔗 [Xem repo](https://github.com/ripienaar/free-for-dev)"
+          SUMMARY=$(cat /tmp/summary.txt | head -c 3500)
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
               --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-              --arg text "$MESSAGE" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "MarkdownV2", disable_web_page_preview: true}')"
+              --arg summary "$SUMMARY" \
+              '{
+                chat_id: $chat_id,
+                text: ("🔔 free-for-dev cap nhat moi!\n\n━━━━━━━━━━━━━━━\n" + $summary + "\n━━━━━━━━━━━━━━━\n🔗 https://github.com/ripienaar/free-for-dev"),
+                disable_web_page_preview: true
+              }')"
 
       - name: Save new SHA
         if: steps.compare.outputs.changed == 'true'
