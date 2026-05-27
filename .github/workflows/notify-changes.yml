@@ -44,47 +44,25 @@ jobs:
         run: |
           git remote add upstream https://github.com/ripienaar/free-for-dev.git || true
           git fetch upstream main --depth=2
-          git diff upstream/main~1 upstream/main \
-            -- '*.md' '*.json' '*.yaml' '*.yml' \
-            ':!package-lock.json' ':!yarn.lock' \
-            | head -500 > /tmp/upstream_diff.txt
+          git diff upstream/main~1 upstream/main -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -500 > /tmp/upstream_diff.txt
 
       - name: Summarize with AI via OpenRouter
         if: steps.compare.outputs.changed == 'true'
         run: |
-          DIFF=$(cat /tmp/upstream_diff.txt)
-          PROMPT=$(cat .github/prompt.txt)
-          FULL_PROMPT="$PROMPT
-
-DIFF:
-$DIFF"
-
+          cat .github/prompt.txt /tmp/upstream_diff.txt > /tmp/full_prompt.txt
           RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg content "$FULL_PROMPT" '{
-              model: "nvidia/nemotron-3-super-120b-a12b:free",
-              max_tokens: 2048,
-              messages: [{ role: "user", content: $content }]
-            }')")
-
+            -d "$(jq -Rs '{ model: "nvidia/nemotron-3-super-120b-a12b:free", max_tokens: 2048, messages: [{ role: "user", content: . }] }' /tmp/full_prompt.txt)")
           echo "$RESPONSE" | jq -r '.choices[0].message.content // "Khong the tom tat duoc."' > /tmp/summary.txt
 
       - name: Send to Telegram
         if: steps.compare.outputs.changed == 'true'
         run: |
           SUMMARY=$(cat /tmp/summary.txt | head -c 3500)
-
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-              --arg summary "$SUMMARY" \
-              '{
-                chat_id: $chat_id,
-                text: ("free-for-dev cap nhat moi!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
-                disable_web_page_preview: true
-              }')"
+            -d "$(jq -n --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" --arg summary "$SUMMARY" '{chat_id: $chat_id, text: ("free-for-dev cap nhat moi!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"), disable_web_page_preview: true}')"
 
       - name: Save new SHA
         if: steps.compare.outputs.changed == 'true'
