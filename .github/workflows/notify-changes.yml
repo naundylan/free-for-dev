@@ -43,7 +43,7 @@ jobs:
         if: steps.compare.outputs.changed == 'true'
         run: |
           git remote add upstream https://github.com/ripienaar/free-for-dev.git || true
-          git fetch upstream main --depth=2
+          git fetch upstream master --depth=2
           git diff upstream/main~1 upstream/main -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -500 > /tmp/upstream_diff.txt
 
       - name: Summarize with AI via OpenRouter
