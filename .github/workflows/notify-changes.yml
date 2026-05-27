@@ -15,76 +15,60 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get latest commit from upstream
-        id: upstream
-        run: |
-          UPSTREAM_SHA=$(git ls-remote https://github.com/ripienaar/free-for-dev.git HEAD | cut -f1)
-          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
-
-      - name: Load last known SHA
-        id: last
-        run: |
-          if [ -f .last_sha ]; then
-            echo "last_sha=$(cat .last_sha)" >> $GITHUB_OUTPUT
-            echo "first_run=false" >> $GITHUB_OUTPUT
-          else
-            echo "last_sha=" >> $GITHUB_OUTPUT
-            echo "first_run=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Compare SHAs
-        id: compare
-        run: |
-          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          elif [ "${{ steps.upstream.outputs.upstream_sha }}" != "${{ steps.last.outputs.last_sha }}" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get content from upstream
-        if: steps.compare.outputs.changed == 'true'
+      - name: Get upstream content
         run: |
           git remote add upstream https://github.com/ripienaar/free-for-dev.git || true
           git fetch upstream master --depth=2
+          git show upstream/master:README.md > /tmp/readme.txt
 
-          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
-            # Lần đầu: lấy full README nhưng giới hạn 300 dòng để tránh quá dài
-            git show upstream/master:README.md | head -300 > /tmp/upstream_content.txt
-            cp .github/prompt.txt /tmp/active_prompt.txt
-          else
-            git diff upstream/master~1 upstream/master -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -300 > /tmp/upstream_content.txt
-            cp .github/prompt_diff.txt /tmp/active_prompt.txt
-          fi
-
-          # Gộp prompt + content vào 1 file
-          cat /tmp/active_prompt.txt /tmp/upstream_content.txt > /tmp/full_prompt.txt
-
-      - name: Summarize with AI via OpenRouter
-        if: steps.compare.outputs.changed == 'true'
+      - name: Pick 2 random tools and summarize
         run: |
-          # Dùng python để build JSON payload từ file, tránh lỗi "Argument list too long"
+          python3 << 'PYEOF'
+          import re, random, json, subprocess, os
+
+          with open("/tmp/readme.txt", "r") as f:
+              content = f.read()
+
+          # Parse từng tool: dòng bắt đầu bằng "- [TenTool](...) - mô tả"
+          tools = re.findall(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', content, re.MULTILINE)
+
+          if len(tools) < 2:
+              print("Không đủ tool để random")
+              exit(0)
+
+          picked = random.sample(tools, 2)
+
+          tool_text = ""
+          for name, url, desc in picked:
+              tool_text += f"- {name} ({url}): {desc}\n"
+
+          with open("/tmp/picked_tools.txt", "w") as f:
+              f.write(tool_text)
+
+          print("Picked tools:")
+          print(tool_text)
+          PYEOF
+
+      - name: Build AI prompt for random tools
+        run: |
+          cat .github/prompt.txt /tmp/picked_tools.txt > /tmp/full_prompt.txt
           python3 - << 'PYEOF'
-          import json, subprocess
+          import json
 
           with open("/tmp/full_prompt.txt", "r") as f:
               content = f.read()
 
           payload = {
               "model": "z-ai/glm-4-5-air:free",
-              "max_tokens": 2048,
+              "max_tokens": 1024,
               "messages": [{"role": "user", "content": content}]
           }
 
           with open("/tmp/payload.json", "w") as f:
               json.dump(payload, f)
-
-          print("Payload written, size:", len(content), "chars")
           PYEOF
 
-      - name: Call OpenRouter API
-        if: steps.compare.outputs.changed == 'true'
+      - name: Call OpenRouter API for random tools
         run: |
           curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
@@ -95,32 +79,84 @@ jobs:
           cat /tmp/response_raw.txt
           echo "=== END ==="
           jq -r '.choices[0].message.content // "Không thể tóm tắt được."' /tmp/response_raw.txt > /tmp/summary.txt
-          echo "Summary:"
-          cat /tmp/summary.txt
 
-      - name: Send to Telegram
-        if: steps.compare.outputs.changed == 'true'
+      - name: Send random tools to Telegram
         run: |
-          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
-            HEADER="📋 free-for-dev — Tổng hợp lần đầu!"
-          else
-            HEADER="🔔 free-for-dev có cập nhật mới!"
-          fi
           SUMMARY=$(cat /tmp/summary.txt | head -c 3500)
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
               --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-              --arg header "$HEADER" \
               --arg summary "$SUMMARY" \
               '{
                 chat_id: $chat_id,
-                text: ($header + "\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
+                text: ("🎲 2 tool random hôm nay!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
+                disable_web_page_preview: true
+              }')"
+
+      - name: Check for upstream changes
+        id: upstream
+        run: |
+          UPSTREAM_SHA=$(git ls-remote https://github.com/ripienaar/free-for-dev.git HEAD | cut -f1)
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          if [ -f .last_sha ]; then
+            LAST_SHA=$(cat .last_sha)
+            if [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
+              echo "changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "changed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get diff if changed
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          git diff upstream/master~1 upstream/master -- '*.md' ':!package-lock.json' | head -300 > /tmp/upstream_diff.txt
+          cat .github/prompt_diff.txt /tmp/upstream_diff.txt > /tmp/full_diff_prompt.txt
+          python3 - << 'PYEOF'
+          import json
+
+          with open("/tmp/full_diff_prompt.txt", "r") as f:
+              content = f.read()
+
+          payload = {
+              "model": "z-ai/glm-4-5-air:free",
+              "max_tokens": 1024,
+              "messages": [{"role": "user", "content": content}]
+          }
+
+          with open("/tmp/payload_diff.json", "w") as f:
+              json.dump(payload, f)
+          PYEOF
+
+      - name: Call OpenRouter API for diff
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          curl -s https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/payload_diff.json \
+            | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary_diff.txt
+
+      - name: Send diff to Telegram
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          SUMMARY=$(cat /tmp/summary_diff.txt | head -c 3500)
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --arg summary "$SUMMARY" \
+              '{
+                chat_id: $chat_id,
+                text: ("🔔 free-for-dev có cập nhật mới!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
                 disable_web_page_preview: true
               }')"
 
       - name: Save new SHA
-        if: steps.compare.outputs.changed == 'true'
+        if: steps.upstream.outputs.changed == 'true'
         run: |
           echo "${{ steps.upstream.outputs.upstream_sha }}" > .last_sha
           git config user.name "github-actions[bot]"
