@@ -48,43 +48,17 @@ jobs:
             -- '*.md' '*.json' '*.yaml' '*.yml' \
             ':!package-lock.json' ':!yarn.lock' \
             | head -500 > /tmp/upstream_diff.txt
-          echo "Diff size: $(wc -c < /tmp/upstream_diff.txt) bytes"
 
       - name: Summarize with AI via OpenRouter
         if: steps.compare.outputs.changed == 'true'
         run: |
           DIFF=$(cat /tmp/upstream_diff.txt)
+          PROMPT=$(cat .github/prompt.txt)
+          FULL_PROMPT="$PROMPT
 
-          # Viết prompt ra file để tránh lỗi YAML với ký tự đặc biệt
-          cat > /tmp/prompt.txt << 'PROMPT_EOF'
-Ban la tro ly phan tich changelog cho developer Viet Nam.
+DIFF:
+$DIFF"
 
-Duoi day la git diff tu repo free-for-dev (danh sach cong cu/dich vu free cho developer).
-
-Hay phan tich va tra loi DUNG theo format sau, KHONG them bat ky noi dung nao ngoai format:
-
-Neu co tool MOI duoc them vao, voi MOI tool viet:
-🛠 [Ten Tool]
-📌 Ve gi: [1 cau mo ta linh vuc, vi du: dich vu host backend mien phi]
-🎁 Free tier: [gioi han cu the, vi du: 512MB RAM, 1GB storage, khong gioi han request]
-💡 Dung khi: [2-3 usecase thuc te ngan gon, vi du: host API nho, deploy side project, test MVP]
-
-Neu co tool BI XOA:
-❌ [Ten Tool] — [ly do neu co, neu khong thi ghi: khong ro ly do]
-
-Neu co tool duoc CAP NHAT thong tin:
-✏️ [Ten Tool] — [thay doi gi cu the]
-
-Neu KHONG co thay doi nao dang chu y (chi fix typo, format...):
-ℹ️ Khong co tool moi, chi cap nhat nho.
-
----
-PROMPT_EOF
-
-          # Gộp prompt + diff
-          FULL_PROMPT=$(cat /tmp/prompt.txt; echo "DIFF:"; echo "$DIFF")
-
-          # Gọi OpenRouter API
           RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
@@ -95,8 +69,6 @@ PROMPT_EOF
             }')")
 
           echo "$RESPONSE" | jq -r '.choices[0].message.content // "Khong the tom tat duoc."' > /tmp/summary.txt
-          echo "Summary generated:"
-          cat /tmp/summary.txt
 
       - name: Send to Telegram
         if: steps.compare.outputs.changed == 'true'
@@ -110,7 +82,7 @@ PROMPT_EOF
               --arg summary "$SUMMARY" \
               '{
                 chat_id: $chat_id,
-                text: ("🔔 free-for-dev cap nhat moi!\n\n━━━━━━━━━━━━━━━\n" + $summary + "\n━━━━━━━━━━━━━━━\n🔗 https://github.com/ripienaar/free-for-dev"),
+                text: ("free-for-dev cap nhat moi!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
                 disable_web_page_preview: true
               }')"
 
