@@ -26,43 +26,73 @@ jobs:
         run: |
           if [ -f .last_sha ]; then
             echo "last_sha=$(cat .last_sha)" >> $GITHUB_OUTPUT
+            echo "first_run=false" >> $GITHUB_OUTPUT
           else
             echo "last_sha=" >> $GITHUB_OUTPUT
+            echo "first_run=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Compare SHAs
         id: compare
         run: |
-          if [ "${{ steps.upstream.outputs.upstream_sha }}" != "${{ steps.last.outputs.last_sha }}" ]; then
+          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.upstream.outputs.upstream_sha }}" != "${{ steps.last.outputs.last_sha }}" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Get diff from upstream
+      - name: Get content from upstream
         if: steps.compare.outputs.changed == 'true'
         run: |
           git remote add upstream https://github.com/ripienaar/free-for-dev.git || true
           git fetch upstream master --depth=2
-          git diff upstream/main~1 upstream/main -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -500 > /tmp/upstream_diff.txt
+
+          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
+            # Lần đầu: lấy toàn bộ README
+            git show upstream/master:README.md | head -1000 > /tmp/upstream_content.txt
+            cp .github/prompt.txt /tmp/active_prompt.txt
+          else
+            # Các lần sau: chỉ lấy diff
+            git diff upstream/master~1 upstream/master -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -500 > /tmp/upstream_content.txt
+            cp .github/prompt_diff.txt /tmp/active_prompt.txt
+          fi
 
       - name: Summarize with AI via OpenRouter
         if: steps.compare.outputs.changed == 'true'
         run: |
-          cat .github/prompt.txt /tmp/upstream_diff.txt > /tmp/full_prompt.txt
+          cat /tmp/active_prompt.txt /tmp/upstream_content.txt > /tmp/full_prompt.txt
           RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -Rs '{ model: "nvidia/nemotron-3-super-120b-a12b:free", max_tokens: 2048, messages: [{ role: "user", content: . }] }' /tmp/full_prompt.txt)")
-          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Khong the tom tat duoc."' > /tmp/summary.txt
+            -d "$(jq -Rs '{
+              model: "nvidia/nemotron-3-super-120b-a12b:free",
+              max_tokens: 2048,
+              messages: [{ role: "user", content: . }]
+            }' /tmp/full_prompt.txt)")
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary.txt
 
       - name: Send to Telegram
         if: steps.compare.outputs.changed == 'true'
         run: |
+          if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
+            HEADER="📋 free-for-dev — Tổng hợp lần đầu!"
+          else
+            HEADER="🔔 free-for-dev có cập nhật mới!"
+          fi
           SUMMARY=$(cat /tmp/summary.txt | head -c 3500)
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" --arg summary "$SUMMARY" '{chat_id: $chat_id, text: ("free-for-dev cap nhat moi!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"), disable_web_page_preview: true}')"
+            -d "$(jq -n \
+              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --arg header "$HEADER" \
+              --arg summary "$SUMMARY" \
+              '{
+                chat_id: $chat_id,
+                text: ($header + "\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
+                disable_web_page_preview: true
+              }')"
 
       - name: Save new SHA
         if: steps.compare.outputs.changed == 'true'
