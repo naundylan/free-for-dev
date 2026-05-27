@@ -72,7 +72,7 @@ jobs:
               content = f.read()
 
           payload = {
-              "model": "deepseek/deepseek-v4-flash:free",
+              "model": "z-ai/glm-4-5-air:free",
               "max_tokens": 2048,
               "messages": [{"role": "user", "content": content}]
           }
