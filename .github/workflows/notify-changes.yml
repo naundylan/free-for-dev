@@ -59,7 +59,7 @@ jobs:
               content = f.read()
 
           payload = {
-              "model": "z-ai/glm-4-5-air:free",
+              "model": "poolside/laguna-xs.2:free",
               "max_tokens": 1024,
               "messages": [{"role": "user", "content": content}]
           }
@@ -122,7 +122,7 @@ jobs:
               content = f.read()
 
           payload = {
-              "model": "z-ai/glm-4-5-air:free",
+              "model": "poolside/laguna-xs.2:free",
               "max_tokens": 1024,
               "messages": [{"role": "user", "content": content}]
           }
