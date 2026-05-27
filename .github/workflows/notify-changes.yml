@@ -50,28 +50,49 @@ jobs:
           git fetch upstream master --depth=2
 
           if [ "${{ steps.last.outputs.first_run }}" == "true" ]; then
-            # Lần đầu: lấy toàn bộ README
-            git show upstream/master:README.md | head -1000 > /tmp/upstream_content.txt
+            # Lần đầu: lấy full README nhưng giới hạn 300 dòng để tránh quá dài
+            git show upstream/master:README.md | head -300 > /tmp/upstream_content.txt
             cp .github/prompt.txt /tmp/active_prompt.txt
           else
-            # Các lần sau: chỉ lấy diff
-            git diff upstream/master~1 upstream/master -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -500 > /tmp/upstream_content.txt
+            git diff upstream/master~1 upstream/master -- '*.md' '*.json' '*.yaml' '*.yml' ':!package-lock.json' ':!yarn.lock' | head -300 > /tmp/upstream_content.txt
             cp .github/prompt_diff.txt /tmp/active_prompt.txt
           fi
+
+          # Gộp prompt + content vào 1 file
+          cat /tmp/active_prompt.txt /tmp/upstream_content.txt > /tmp/full_prompt.txt
 
       - name: Summarize with AI via OpenRouter
         if: steps.compare.outputs.changed == 'true'
         run: |
-          cat /tmp/active_prompt.txt /tmp/upstream_content.txt > /tmp/full_prompt.txt
-          RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+          # Dùng python để build JSON payload từ file, tránh lỗi "Argument list too long"
+          python3 - << 'PYEOF'
+          import json, subprocess
+
+          with open("/tmp/full_prompt.txt", "r") as f:
+              content = f.read()
+
+          payload = {
+              "model": "nvidia/nemotron-3-super-120b-a12b:free",
+              "max_tokens": 2048,
+              "messages": [{"role": "user", "content": content}]
+          }
+
+          with open("/tmp/payload.json", "w") as f:
+              json.dump(payload, f)
+
+          print("Payload written, size:", len(content), "chars")
+          PYEOF
+
+      - name: Call OpenRouter API
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -Rs '{
-              model: "nvidia/nemotron-3-super-120b-a12b:free",
-              max_tokens: 2048,
-              messages: [{ role: "user", content: . }]
-            }' /tmp/full_prompt.txt)")
-          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary.txt
+            -d @/tmp/payload.json \
+            | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary.txt
+          echo "Summary:"
+          cat /tmp/summary.txt
 
       - name: Send to Telegram
         if: steps.compare.outputs.changed == 'true'
