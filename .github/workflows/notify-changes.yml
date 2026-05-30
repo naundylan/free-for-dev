@@ -24,18 +24,26 @@ jobs:
       - name: Pick 2 random tools (no repeat)
         run: |
           python3 << 'PYEOF'
-          import re, random, json, os
+          import re, random, json
 
           with open("/tmp/readme.txt", "r") as f:
               content = f.read()
 
-          tools = re.findall(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', content, re.MULTILINE)
+          # Parse tool kèm category (heading trước đó)
+          tools_with_category = []
+          current_category = "Uncategorized"
+          for line in content.split('\n'):
+              heading = re.match(r'^#{1,3}\s+(.+)$', line)
+              if heading:
+                  current_category = heading.group(1).strip()
+              m = re.match(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', line)
+              if m:
+                  tools_with_category.append((m.group(1), m.group(2), m.group(3), current_category))
 
-          if len(tools) < 2:
+          if len(tools_with_category) < 2:
               print("Không đủ tool để random")
               exit(0)
 
-          # Load lịch sử đã gửi
           history_file = '.sent_history'
           try:
               with open(history_file) as f:
@@ -43,88 +51,76 @@ jobs:
           except:
               sent = []
 
-          # Lọc tool chưa gửi
-          available = [i for i in range(len(tools)) if i not in sent]
-
-          # Nếu đã gửi hết thì reset
+          available = [i for i in range(len(tools_with_category)) if i not in sent]
           if len(available) < 2:
-              print("Đã gửi hết tất cả tool, reset lịch sử...")
+              print("Reset lịch sử...")
               sent = []
-              available = list(range(len(tools)))
+              available = list(range(len(tools_with_category)))
 
           chosen_indices = random.sample(available, 2)
-          picked = [tools[i] for i in chosen_indices]
+          picked = [tools_with_category[i] for i in chosen_indices]
 
-          # Cập nhật history
           sent.extend(chosen_indices)
           with open(history_file, 'w') as f:
               json.dump(sent, f)
 
-          # Lưu tool đã chọn
-          tool_text = ""
-          for name, url, desc in picked:
-              tool_text += f"- {name} ({url}): {desc}\n"
+          # Lưu từng tool riêng
+          for idx, (name, url, desc, category) in enumerate(picked):
+              tool_text = f"- {name} ({url}): {desc}"
+              with open(f"/tmp/tool_{idx}.txt", "w") as f:
+                  f.write(tool_text)
+              with open(f"/tmp/tool_{idx}_meta.json", "w") as f:
+                  json.dump({"name": name, "url": url, "category": category}, f, ensure_ascii=False)
 
-          with open("/tmp/picked_tools.txt", "w") as f:
-              f.write(tool_text)
-
-          # Lưu indices để dùng sau
-          with open("/tmp/chosen_indices.json", "w") as f:
-              json.dump(chosen_indices, f)
-
-          print("Picked tools:")
-          print(tool_text)
+          print(f"Picked: {[p[0] for p in picked]}")
           PYEOF
 
-      - name: Build AI prompt for random tools
+      - name: Summarize and send tool 0
         run: |
-          cat .github/prompt.txt /tmp/picked_tools.txt > /tmp/full_prompt.txt
-          python3 - << 'PYEOF'
-          import json
+          python3 << 'PYEOF'
+          import json, subprocess, re, requests, os
 
-          with open("/tmp/full_prompt.txt", "r") as f:
-              content = f.read()
+          with open("/tmp/tool_0_meta.json") as f:
+              meta = json.load(f)
+          with open("/tmp/tool_0.txt") as f:
+              tool_text = f.read()
+          with open(".github/prompt.txt") as f:
+              prompt = f.read()
 
           payload = {
               "model": "poolside/laguna-xs.2:free",
               "max_tokens": 1024,
-              "messages": [{"role": "user", "content": content}]
+              "messages": [{"role": "user", "content": prompt + "\n\n" + tool_text}]
           }
 
-          with open("/tmp/payload.json", "w") as f:
-              json.dump(payload, f)
-          PYEOF
+          import urllib.request, urllib.error
+          import json as jsonlib
 
-      - name: Call OpenRouter API for random tools
-        run: |
-          curl -s https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d @/tmp/payload.json \
-            > /tmp/response_raw.txt
-          echo "=== RAW RESPONSE ==="
-          cat /tmp/response_raw.txt
-          echo "=== END ==="
-          jq -r '.choices[0].message.content // "Không thể tóm tắt được."' /tmp/response_raw.txt > /tmp/summary.txt
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=jsonlib.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = jsonlib.loads(resp.read())
 
-      - name: Send random tools to Telegram (auto split)
-        run: |
-          python3 << 'PYEOF'
-          import os, requests, json
+          summary = data["choices"][0]["message"]["content"]
 
-          token = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-          chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
+          # Filter </think> blocks
+          summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
+          summary = re.sub(r'</think>', '', summary).strip()
 
-          with open("/tmp/summary.txt") as f:
-              summary = f.read().strip()
-
-          header = "🎲 2 tool random hôm nay!\n\n"
+          # Build tin nhắn
+          name = meta["name"]
+          category = meta["category"]
+          header = f"🎲 Tool random hôm nay!\n📂 {category}\n\n"
           footer = "\n\nhttps://github.com/ripienaar/free-for-dev"
           full_text = header + summary + footer
 
           LIMIT = 4000
-
-          # Chia theo paragraph, không cắt giữa chừng
           chunks = []
           current = ""
           for para in full_text.split('\n\n'):
@@ -137,27 +133,117 @@ jobs:
           if current:
               chunks.append(current.strip())
 
-          # Gửi từng chunk, chỉ chunk cuối có nút
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+
+          # Lưu summary để dùng khi bấm lưu
+          save_data = jsonlib.dumps({
+              "name": name,
+              "category": category,
+              "content": summary
+          })
+          with open("/tmp/tool_0_summary.json", "w") as f:
+              f.write(save_data)
+
           for i, chunk in enumerate(chunks):
               is_last = (i == len(chunks) - 1)
-              payload = {
+              msg_payload = {
                   "chat_id": chat_id,
                   "text": chunk,
                   "disable_web_page_preview": True
               }
               if is_last:
-                  payload["reply_markup"] = {
+                  msg_payload["reply_markup"] = {
                       "inline_keyboard": [[
-                          {"text": "✅ Lưu vào Obsidian", "callback_data": "save_random"},
+                          {"text": f"✅ Lưu [{name}]", "callback_data": f"save_random:0"},
                           {"text": "❌ Bỏ qua", "callback_data": "skip"}
                       ]]
                   }
-              requests.post(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  json=payload
-              )
-              print(f"Sent chunk {i+1}/{len(chunks)}")
+              requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=msg_payload)
+              print(f"Tool 0 chunk {i+1}/{len(chunks)} sent")
           PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Summarize and send tool 1
+        run: |
+          python3 << 'PYEOF'
+          import json, re, requests, os, urllib.request
+          import json as jsonlib
+
+          with open("/tmp/tool_1_meta.json") as f:
+              meta = json.load(f)
+          with open("/tmp/tool_1.txt") as f:
+              tool_text = f.read()
+          with open(".github/prompt.txt") as f:
+              prompt = f.read()
+
+          payload = {
+              "model": "poolside/laguna-xs.2:free",
+              "max_tokens": 1024,
+              "messages": [{"role": "user", "content": prompt + "\n\n" + tool_text}]
+          }
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=jsonlib.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = jsonlib.loads(resp.read())
+
+          summary = data["choices"][0]["message"]["content"]
+          summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
+          summary = re.sub(r'</think>', '', summary).strip()
+
+          name = meta["name"]
+          category = meta["category"]
+          header = f"🎲 Tool random hôm nay!\n📂 {category}\n\n"
+          footer = "\n\nhttps://github.com/ripienaar/free-for-dev"
+          full_text = header + summary + footer
+
+          LIMIT = 4000
+          chunks = []
+          current = ""
+          for para in full_text.split('\n\n'):
+              if len(current) + len(para) + 2 > LIMIT:
+                  if current:
+                      chunks.append(current.strip())
+                  current = para
+              else:
+                  current += '\n\n' + para if current else para
+          if current:
+              chunks.append(current.strip())
+
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+
+          for i, chunk in enumerate(chunks):
+              is_last = (i == len(chunks) - 1)
+              msg_payload = {
+                  "chat_id": chat_id,
+                  "text": chunk,
+                  "disable_web_page_preview": True
+              }
+              if is_last:
+                  msg_payload["reply_markup"] = {
+                      "inline_keyboard": [[
+                          {"text": f"✅ Lưu [{name}]", "callback_data": f"save_random:1"},
+                          {"text": "❌ Bỏ qua", "callback_data": "skip"}
+                      ]]
+                  }
+              requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=msg_payload)
+              print(f"Tool 1 chunk {i+1}/{len(chunks)} sent")
+          PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Check for upstream changes
         id: upstream
@@ -183,7 +269,6 @@ jobs:
           python3 << 'PYEOF'
           import re, json
 
-          # Load lịch sử đã gửi để check tool nào đã biết
           try:
               with open('.sent_history') as f:
                   sent_indices = json.load(f)
@@ -192,13 +277,13 @@ jobs:
 
           with open("/tmp/readme.txt") as f:
               content = f.read()
+
           all_tools = re.findall(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', content, re.MULTILINE)
           sent_names = {all_tools[i][0] for i in sent_indices if i < len(all_tools)}
 
           with open("/tmp/upstream_diff.txt") as f:
               diff = f.read()
 
-          # Parse tool mới và tool update từ diff
           new_tools = []
           updated_tools = []
 
@@ -214,74 +299,56 @@ jobs:
                   else:
                       new_tools.append(f"🆕 *{name}* — {desc}\n{url}")
 
-          result = {
-              "new": new_tools,
-              "updated": updated_tools
-          }
-
           with open("/tmp/diff_classified.json", "w") as f:
-              json.dump(result, f, ensure_ascii=False)
+              json.dump({"new": new_tools, "updated": updated_tools}, f, ensure_ascii=False)
 
           print(f"New: {len(new_tools)}, Updated: {len(updated_tools)}")
           PYEOF
 
-      - name: Build diff prompt
+      - name: Build and send diff summary
         if: steps.upstream.outputs.changed == 'true'
         run: |
-          cat .github/prompt_diff.txt /tmp/upstream_diff.txt > /tmp/full_diff_prompt.txt
-          python3 - << 'PYEOF'
-          import json
+          python3 << 'PYEOF'
+          import json, re, requests, os, urllib.request
+          import json as jsonlib
 
-          with open("/tmp/full_diff_prompt.txt", "r") as f:
-              content = f.read()
+          with open(".github/prompt_diff.txt") as f:
+              prompt = f.read()
+          with open("/tmp/upstream_diff.txt") as f:
+              diff = f.read()
+          with open("/tmp/diff_classified.json") as f:
+              classified = json.load(f)
 
           payload = {
               "model": "poolside/laguna-xs.2:free",
               "max_tokens": 1024,
-              "messages": [{"role": "user", "content": content}]
+              "messages": [{"role": "user", "content": prompt + "\n\n" + diff}]
           }
 
-          with open("/tmp/payload_diff.json", "w") as f:
-              json.dump(payload, f)
-          PYEOF
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=jsonlib.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = jsonlib.loads(resp.read())
 
-      - name: Call OpenRouter API for diff
-        if: steps.upstream.outputs.changed == 'true'
-        run: |
-          curl -s https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer ${{ secrets.OPENROUTER_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d @/tmp/payload_diff.json \
-            | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary_diff.txt
+          summary = data["choices"][0]["message"]["content"]
+          summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
+          summary = re.sub(r'</think>', '', summary).strip()
 
-      - name: Send diff to Telegram (auto split + classify)
-        if: steps.upstream.outputs.changed == 'true'
-        run: |
-          python3 << 'PYEOF'
-          import os, requests, json
-
-          token = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-          chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
-
-          with open("/tmp/summary_diff.txt") as f:
-              summary = f.read().strip()
-
-          with open("/tmp/diff_classified.json") as f:
-              classified = json.load(f)
-
-          # Build phần classify
           classify_text = ""
           if classified["updated"]:
               classify_text += "\n\n📌 *Tool bạn đã biết có thay đổi:*\n" + "\n".join(classified["updated"])
           if classified["new"]:
               classify_text += "\n\n✨ *Tool mới hoàn toàn:*\n" + "\n".join(classified["new"])
 
-          header = "🔔 free-for-dev có cập nhật mới!\n\n"
-          footer = "\n\nhttps://github.com/ripienaar/free-for-dev"
-          full_text = header + summary + classify_text + footer
+          full_text = "🔔 free-for-dev có cập nhật mới!\n\n" + summary + classify_text + "\n\nhttps://github.com/ripienaar/free-for-dev"
 
           LIMIT = 4000
-
           chunks = []
           current = ""
           for para in full_text.split('\n\n'):
@@ -294,27 +361,30 @@ jobs:
           if current:
               chunks.append(current.strip())
 
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+
           for i, chunk in enumerate(chunks):
               is_last = (i == len(chunks) - 1)
-              payload = {
+              msg_payload = {
                   "chat_id": chat_id,
                   "text": chunk,
                   "parse_mode": "Markdown",
                   "disable_web_page_preview": True
               }
               if is_last:
-                  payload["reply_markup"] = {
+                  msg_payload["reply_markup"] = {
                       "inline_keyboard": [[
-                          {"text": "✅ Lưu vào Obsidian", "callback_data": "save_diff"},
+                          {"text": "✅ Lưu update", "callback_data": "save_diff"},
                           {"text": "❌ Bỏ qua", "callback_data": "skip"}
                       ]]
                   }
-              requests.post(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  json=payload
-              )
-              print(f"Sent chunk {i+1}/{len(chunks)}")
+              requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=msg_payload)
           PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Save new SHA and history
         if: steps.upstream.outputs.changed == 'true'
