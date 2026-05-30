@@ -21,29 +21,56 @@ jobs:
           git fetch upstream master --depth=2
           git show upstream/master:README.md > /tmp/readme.txt
 
-      - name: Pick 2 random tools and summarize
+      - name: Pick 2 random tools (no repeat)
         run: |
           python3 << 'PYEOF'
-          import re, random, json, subprocess, os
+          import re, random, json, os
 
           with open("/tmp/readme.txt", "r") as f:
               content = f.read()
 
-          # Parse từng tool: dòng bắt đầu bằng "- [TenTool](...) - mô tả"
           tools = re.findall(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', content, re.MULTILINE)
 
           if len(tools) < 2:
               print("Không đủ tool để random")
               exit(0)
 
-          picked = random.sample(tools, 2)
+          # Load lịch sử đã gửi
+          history_file = '.sent_history'
+          try:
+              with open(history_file) as f:
+                  sent = json.load(f)
+          except:
+              sent = []
 
+          # Lọc tool chưa gửi
+          available = [i for i in range(len(tools)) if i not in sent]
+
+          # Nếu đã gửi hết thì reset
+          if len(available) < 2:
+              print("Đã gửi hết tất cả tool, reset lịch sử...")
+              sent = []
+              available = list(range(len(tools)))
+
+          chosen_indices = random.sample(available, 2)
+          picked = [tools[i] for i in chosen_indices]
+
+          # Cập nhật history
+          sent.extend(chosen_indices)
+          with open(history_file, 'w') as f:
+              json.dump(sent, f)
+
+          # Lưu tool đã chọn
           tool_text = ""
           for name, url, desc in picked:
               tool_text += f"- {name} ({url}): {desc}\n"
 
           with open("/tmp/picked_tools.txt", "w") as f:
               f.write(tool_text)
+
+          # Lưu indices để dùng sau
+          with open("/tmp/chosen_indices.json", "w") as f:
+              json.dump(chosen_indices, f)
 
           print("Picked tools:")
           print(tool_text)
@@ -80,19 +107,57 @@ jobs:
           echo "=== END ==="
           jq -r '.choices[0].message.content // "Không thể tóm tắt được."' /tmp/response_raw.txt > /tmp/summary.txt
 
-      - name: Send random tools to Telegram
+      - name: Send random tools to Telegram (auto split)
         run: |
-          SUMMARY=$(cat /tmp/summary.txt | head -c 3500)
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-              --arg summary "$SUMMARY" \
-              '{
-                chat_id: $chat_id,
-                text: ("🎲 2 tool random hôm nay!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
-                disable_web_page_preview: true
-              }')"
+          python3 << 'PYEOF'
+          import os, requests, json
+
+          token = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          with open("/tmp/summary.txt") as f:
+              summary = f.read().strip()
+
+          header = "🎲 2 tool random hôm nay!\n\n"
+          footer = "\n\nhttps://github.com/ripienaar/free-for-dev"
+          full_text = header + summary + footer
+
+          LIMIT = 4000
+
+          # Chia theo paragraph, không cắt giữa chừng
+          chunks = []
+          current = ""
+          for para in full_text.split('\n\n'):
+              if len(current) + len(para) + 2 > LIMIT:
+                  if current:
+                      chunks.append(current.strip())
+                  current = para
+              else:
+                  current += '\n\n' + para if current else para
+          if current:
+              chunks.append(current.strip())
+
+          # Gửi từng chunk, chỉ chunk cuối có nút
+          for i, chunk in enumerate(chunks):
+              is_last = (i == len(chunks) - 1)
+              payload = {
+                  "chat_id": chat_id,
+                  "text": chunk,
+                  "disable_web_page_preview": True
+              }
+              if is_last:
+                  payload["reply_markup"] = {
+                      "inline_keyboard": [[
+                          {"text": "✅ Lưu vào Obsidian", "callback_data": "save_random"},
+                          {"text": "❌ Bỏ qua", "callback_data": "skip"}
+                      ]]
+                  }
+              requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json=payload
+              )
+              print(f"Sent chunk {i+1}/{len(chunks)}")
+          PYEOF
 
       - name: Check for upstream changes
         id: upstream
@@ -110,10 +175,59 @@ jobs:
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Get diff if changed
+      - name: Get diff and classify changes
         if: steps.upstream.outputs.changed == 'true'
         run: |
           git diff upstream/master~1 upstream/master -- '*.md' ':!package-lock.json' | head -300 > /tmp/upstream_diff.txt
+
+          python3 << 'PYEOF'
+          import re, json
+
+          # Load lịch sử đã gửi để check tool nào đã biết
+          try:
+              with open('.sent_history') as f:
+                  sent_indices = json.load(f)
+          except:
+              sent_indices = []
+
+          with open("/tmp/readme.txt") as f:
+              content = f.read()
+          all_tools = re.findall(r'^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', content, re.MULTILINE)
+          sent_names = {all_tools[i][0] for i in sent_indices if i < len(all_tools)}
+
+          with open("/tmp/upstream_diff.txt") as f:
+              diff = f.read()
+
+          # Parse tool mới và tool update từ diff
+          new_tools = []
+          updated_tools = []
+
+          for line in diff.split('\n'):
+              if not line.startswith('+') or line.startswith('+++'):
+                  continue
+              line = line[1:].strip()
+              m = re.match(r'[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[-–]\s*(.+)$', line)
+              if m:
+                  name, url, desc = m.groups()
+                  if name in sent_names:
+                      updated_tools.append(f"🔄 *{name}* — {desc}\n{url}")
+                  else:
+                      new_tools.append(f"🆕 *{name}* — {desc}\n{url}")
+
+          result = {
+              "new": new_tools,
+              "updated": updated_tools
+          }
+
+          with open("/tmp/diff_classified.json", "w") as f:
+              json.dump(result, f, ensure_ascii=False)
+
+          print(f"New: {len(new_tools)}, Updated: {len(updated_tools)}")
+          PYEOF
+
+      - name: Build diff prompt
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
           cat .github/prompt_diff.txt /tmp/upstream_diff.txt > /tmp/full_diff_prompt.txt
           python3 - << 'PYEOF'
           import json
@@ -140,27 +254,83 @@ jobs:
             -d @/tmp/payload_diff.json \
             | jq -r '.choices[0].message.content // "Không thể tóm tắt được."' > /tmp/summary_diff.txt
 
-      - name: Send diff to Telegram
+      - name: Send diff to Telegram (auto split + classify)
         if: steps.upstream.outputs.changed == 'true'
         run: |
-          SUMMARY=$(cat /tmp/summary_diff.txt | head -c 3500)
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-              --arg summary "$SUMMARY" \
-              '{
-                chat_id: $chat_id,
-                text: ("🔔 free-for-dev có cập nhật mới!\n\n" + $summary + "\n\nhttps://github.com/ripienaar/free-for-dev"),
-                disable_web_page_preview: true
-              }')"
+          python3 << 'PYEOF'
+          import os, requests, json
 
-      - name: Save new SHA
+          token = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chat_id = "${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          with open("/tmp/summary_diff.txt") as f:
+              summary = f.read().strip()
+
+          with open("/tmp/diff_classified.json") as f:
+              classified = json.load(f)
+
+          # Build phần classify
+          classify_text = ""
+          if classified["updated"]:
+              classify_text += "\n\n📌 *Tool bạn đã biết có thay đổi:*\n" + "\n".join(classified["updated"])
+          if classified["new"]:
+              classify_text += "\n\n✨ *Tool mới hoàn toàn:*\n" + "\n".join(classified["new"])
+
+          header = "🔔 free-for-dev có cập nhật mới!\n\n"
+          footer = "\n\nhttps://github.com/ripienaar/free-for-dev"
+          full_text = header + summary + classify_text + footer
+
+          LIMIT = 4000
+
+          chunks = []
+          current = ""
+          for para in full_text.split('\n\n'):
+              if len(current) + len(para) + 2 > LIMIT:
+                  if current:
+                      chunks.append(current.strip())
+                  current = para
+              else:
+                  current += '\n\n' + para if current else para
+          if current:
+              chunks.append(current.strip())
+
+          for i, chunk in enumerate(chunks):
+              is_last = (i == len(chunks) - 1)
+              payload = {
+                  "chat_id": chat_id,
+                  "text": chunk,
+                  "parse_mode": "Markdown",
+                  "disable_web_page_preview": True
+              }
+              if is_last:
+                  payload["reply_markup"] = {
+                      "inline_keyboard": [[
+                          {"text": "✅ Lưu vào Obsidian", "callback_data": "save_diff"},
+                          {"text": "❌ Bỏ qua", "callback_data": "skip"}
+                      ]]
+                  }
+              requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json=payload
+              )
+              print(f"Sent chunk {i+1}/{len(chunks)}")
+          PYEOF
+
+      - name: Save new SHA and history
         if: steps.upstream.outputs.changed == 'true'
         run: |
           echo "${{ steps.upstream.outputs.upstream_sha }}" > .last_sha
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .last_sha
-          git commit -m "chore: update last known upstream SHA"
+          git add .last_sha .sent_history
+          git commit -m "chore: update SHA and sent history" || echo "Nothing to commit"
+          git push
+
+      - name: Save history after random (if no upstream change)
+        if: steps.upstream.outputs.changed == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .sent_history
+          git commit -m "chore: update sent history" || echo "Nothing to commit"
           git push
