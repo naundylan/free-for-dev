@@ -88,7 +88,7 @@ jobs:
               prompt = f.read()
 
           payload = {
-              "model": "poolside/laguna-xs.2:free",
+              "model": "poolside/laguna-xs-2.1:free",
               "max_tokens": 1024,
               "messages": [{"role": "user", "content": prompt + "\n\n" + tool_text}]
           }
@@ -320,7 +320,7 @@ jobs:
               classified = json.load(f)
 
           payload = {
-              "model": "poolside/laguna-xs.2:free",
+              "model": "poolside/laguna-xs.2.1:free",
               "max_tokens": 1024,
               "messages": [{"role": "user", "content": prompt + "\n\n" + diff}]
           }
